@@ -499,7 +499,7 @@ def get_kyobo_reviews(isbn: str, cache: dict) -> tuple:
 
 
 # ─── Discord 발송 ─────────────────────────────────────────────────────
-DASHBOARD_URL = "https://marketer-h.github.io/review-alarm/"
+DASHBOARD_URL = "https://easyspublishing.github.io/review-alarm/"
 REVIEWS_LOG_FILE = BASE_DIR / "reviews_log.json"
 
 def save_reviews_log(new_reviews: list):
