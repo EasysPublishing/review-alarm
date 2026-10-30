@@ -49,6 +49,9 @@ HTML_HEADERS = {
 JSON_HEADERS = {**HTML_HEADERS, "Accept": "application/json, text/plain, */*"}
 AJAX_HEADERS = {**HTML_HEADERS, "Accept": "*/*", "X-Requested-With": "XMLHttpRequest"}
 
+# 수집 상태 점검용 카운터. 알라딘이 조용히 실패해도 '리뷰 없음'과 구분되도록 센다.
+HEALTH = {"aladin_checked": 0, "aladin_failed": 0}
+
 STORE_NAMES = {"aladin": "알라딘", "yes24": "예스24", "kyobo": "교보문고"}
 STORE_COLORS = {"aladin": 0xEF4128, "yes24": 0xFF6B00, "kyobo": 0x009261}
 STORE_EMOJI = {"aladin": "🔴", "yes24": "🟠", "kyobo": "🟢"}
@@ -123,6 +126,7 @@ def normalize_date(raw: str) -> str:
 def get_aladin_reviews(isbn: str, cache: dict) -> list:
     title_key = f"_aladin_title_{isbn}"
     item_key = f"_aladin_item_{isbn}"
+    HEALTH["aladin_checked"] += 1
 
     try:
         # 상품 페이지 → ItemId + 제목
@@ -132,6 +136,7 @@ def get_aladin_reviews(isbn: str, cache: dict) -> list:
                 headers=HTML_HEADERS, timeout=15,
             )
             if r.status_code != 200:
+                HEALTH["aladin_failed"] += 1
                 return []
             # ItemId: URL 또는 페이지 내 모든 매치 중 0이 아닌 첫번째
             all_ids = re.findall(r'ItemId=(\d+)', r.url + r.text)
@@ -149,6 +154,7 @@ def get_aladin_reviews(isbn: str, cache: dict) -> list:
 
         referer = f"https://www.aladin.co.kr/shop/wproduct.aspx?ItemId={item_id}"
         results = []
+        failed = False  # 요청 실패 또는 '리뷰 블록은 있는데 하나도 못 읽음'이면 True
 
         # 구매평 (CommentReview)
         r1 = requests.get(
@@ -159,8 +165,13 @@ def get_aladin_reviews(isbn: str, cache: dict) -> list:
             f"&IsAjax=true&pageType=0",
             headers={**AJAX_HEADERS, "Referer": referer}, timeout=15,
         )
-        if r1.status_code == 200 and "없습니다" not in r1.text:
-            results.extend(_parse_aladin_comment_reviews(r1.text, title, item_id))
+        if r1.status_code != 200:
+            failed = True
+        elif "없습니다" not in r1.text:
+            parsed = _parse_aladin_comment_reviews(r1.text, title, item_id)
+            if not parsed and "hundred_list" in r1.text:
+                failed = True
+            results.extend(parsed)
 
         # 일반 리뷰 (MyReview)
         r2 = requests.get(
@@ -171,13 +182,21 @@ def get_aladin_reviews(isbn: str, cache: dict) -> list:
             f"&IsAjax=true&pageType=0",
             headers={**AJAX_HEADERS, "Referer": referer}, timeout=15,
         )
-        if r2.status_code == 200 and "없습니다" not in r2.text:
-            results.extend(_parse_aladin_my_reviews(r2.text, title, item_id))
+        if r2.status_code != 200:
+            failed = True
+        elif "없습니다" not in r2.text:
+            parsed = _parse_aladin_my_reviews(r2.text, title, item_id)
+            if not parsed and "hundred_list" in r2.text:
+                failed = True
+            results.extend(parsed)
 
+        if failed:
+            HEALTH["aladin_failed"] += 1
         return results
 
     except Exception as e:
         print(f"    [알라딘 오류] {isbn}: {e}")
+        HEALTH["aladin_failed"] += 1
         return []
 
 
@@ -621,6 +640,71 @@ def send_discord_no_reviews(webhook_url: str):
             print(f"[Discord] 오류: {e}")
 
 
+# ─── 봇 상태 점검 경고 ───────────────────────────────────────────────
+REGISTRY_STALE_DAYS = 45   # 등록된 최신 책 출간일이 이보다 오래되면 신간 누락을 의심
+
+def newest_registered_pub_date():
+    """isbns.txt에 등록된 책 중 가장 최근 출간일. 없으면 None."""
+    newest = None
+    for line in ISBNS_FILE.read_text().splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            d = date.fromisoformat(parts[1])
+        except ValueError:
+            continue
+        if newest is None or d > newest:
+            newest = d
+    return newest
+
+def collect_health_warnings() -> list:
+    """봇이 조용히 고장 나 있을 때 알려줄 경고 목록."""
+    warns = []
+
+    # 1) 알라딘 수집 실패: 절반 이상 책에서 실패하면 경고 (매일)
+    n, bad = HEALTH["aladin_checked"], HEALTH["aladin_failed"]
+    if n >= 5 and bad / n >= 0.5:
+        warns.append(
+            f"알라딘 리뷰 수집 이상: 확인한 {n}권 중 {bad}권에서 읽기 실패. "
+            "알라딘 화면이 바뀌었거나 접속이 막혔을 수 있어요. 알라딘 리뷰가 알림에서 빠지고 있을 수 있습니다."
+        )
+
+    # 2) 신간 등록 정체: 금요일에만 (매일 보내면 소음이 되므로)
+    if datetime.now(KST).weekday() == 4:
+        newest = newest_registered_pub_date()
+        if newest is not None:
+            gap = (datetime.now(KST).date() - newest).days
+            if gap >= REGISTRY_STALE_DAYS:
+                warns.append(
+                    f"신간 등록 정체: 등록된 가장 최근 책의 출간일이 {newest} ({gap}일 전)입니다. "
+                    "그 사이 출간된 신간이 있다면 신간 자동 발견이 멈췄을 수 있어요. "
+                    "새 책은 isbns.txt에 직접 추가할 수 있습니다."
+                )
+    return warns
+
+
+def send_discord_warnings(webhook_url: str, warns: list):
+    if not webhook_url or not warns:
+        return
+    embed = {
+        "title": "⚠️ 리뷰 봇 점검 필요",
+        "description": "\n\n".join(f"• {w}" for w in warns),
+        "color": 0xF59E0B,
+        "footer": {"text": "이지스퍼블리싱 서점 리뷰 봇 · 상태 점검"},
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    for url in (u.strip() for u in webhook_url.split(",") if u.strip()):
+        try:
+            r = requests.post(url, json={"embeds": [embed]}, timeout=10)
+            if r.status_code not in (200, 204):
+                print(f"[점검 경고] 발송 실패: HTTP {r.status_code} ({url[:60]}…)")
+            else:
+                print(f"[점검 경고] 발송 완료 → {url[:60]}…")
+        except Exception as e:
+            print(f"[점검 경고] 오류: {e}")
+
+
 # ─── 주간 요약 (금요일 발송) ─────────────────────────────────────────
 def _summary_clean(text: str) -> str:
     """주간 요약·주목 후기용 간단 정리: [~리뷰] 태그·협찬 고지 문장 제거."""
@@ -903,6 +987,14 @@ def main():
             print("[테스트] --no-discord: '리뷰 없음' 알림도 생략")
         else:
             send_discord_no_reviews(webhook_url)
+
+    # 봇이 조용히 고장 났을 때(알라딘 실패, 신간 등록 정체) 경고
+    if not args.init:
+        warns = collect_health_warnings()
+        for w in warns:
+            print(f"[점검 경고] {w}")
+        if warns and not args.no_discord:
+            send_discord_warnings(webhook_url, warns)
 
     # 금요일이면 일일 알림에 이어 '주간 요약'도 발송 (KST 기준, 월=0…금=4)
     if not args.init and datetime.now(KST).weekday() == 4:

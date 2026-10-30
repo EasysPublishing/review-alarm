@@ -63,28 +63,47 @@ def save_cache(cache: dict):
         json.dump(cache, f, ensure_ascii=False, indent=2)
 
 
-def crawl_kyobo_isbns(max_pages: int = 25) -> set:
-    """교보 출판사 검색을 페이징하며 이지스퍼블리싱 prefix ISBN을 수집."""
+# 검색어를 여러 개 쓰는 이유: '이지스퍼블리싱' 한 가지로만 찾으면 검색 순위에서 밀린
+# 신간이 25페이지 안에 안 들어와 영영 발견되지 않을 수 있다 (7~10월 신간 누락 사례).
+SEARCH_KEYWORDS = ("이지스퍼블리싱", "이지스퍼블리싱 된다", "이지스퍼블리싱 Do it")
+# 결과가 연속으로 몇 페이지 비어야 '끝'으로 볼지. 기존 2는 너무 짧아 중간에 끊길 수 있었다.
+EMPTY_STREAK_LIMIT = 5
+
+
+def crawl_kyobo_isbns(max_pages: int = 40) -> set:
+    """교보 검색을 검색어별로 페이징하며 이지스퍼블리싱 prefix ISBN을 수집."""
     found: set = set()
-    empty_streak = 0
-    for page in range(1, max_pages + 1):
-        url = ("https://search.kyobobook.co.kr/search?keyword=이지스퍼블리싱"
-               f"&gbCode=TOT&target=total&page={page}")
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=20)
-        except Exception as e:
-            print(f"  [page {page}] 요청 오류: {e}")
-            break
-        bids = {b for b in re.findall(r'data-bid="(97[89]\d{10})"', r.text)
-                if b.startswith(EASYS_PREFIXES)}
-        found |= bids
-        if not bids:
-            empty_streak += 1
-            if empty_streak >= 2:
+    for kw in SEARCH_KEYWORDS:
+        kw_found: set = set()
+        empty_streak = 0
+        pages_ok = 0
+        for page in range(1, max_pages + 1):
+            url = (f"https://search.kyobobook.co.kr/search?keyword={kw}"
+                   f"&gbCode=TOT&target=total&page={page}")
+            try:
+                r = requests.get(url, headers=HEADERS, timeout=20)
+            except Exception as e:
+                print(f"  [{kw} / page {page}] 요청 오류: {e}")
                 break
-        else:
-            empty_streak = 0
-        time.sleep(0.4)
+            if r.status_code != 200:
+                print(f"  [{kw} / page {page}] HTTP {r.status_code}")
+                break
+            pages_ok += 1
+            bids = {b for b in re.findall(r'data-bid="(97[89]\d{10})"', r.text)
+                    if b.startswith(EASYS_PREFIXES)}
+            kw_found |= bids
+            if not bids:
+                empty_streak += 1
+                if empty_streak >= EMPTY_STREAK_LIMIT:
+                    break
+            else:
+                empty_streak = 0
+            time.sleep(0.4)
+        print(f"  [{kw}] {pages_ok}페이지 확인 → 이지스 ISBN {len(kw_found)}개")
+        found |= kw_found
+    if not found:
+        print("[경고] 교보 검색에서 이지스퍼블리싱 책을 하나도 못 찾았습니다. "
+              "교보 화면 구조가 바뀌었거나 접속이 막혔을 수 있습니다.")
     return found
 
 
