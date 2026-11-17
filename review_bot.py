@@ -123,6 +123,61 @@ def normalize_date(raw: str) -> str:
 
 
 # ─── 알라딘 ──────────────────────────────────────────────────────────
+# 알라딘이 requests(일반 접속)를 막거나 엉뚱한 화면을 주면, 진짜 브라우저(Playwright)로 다시 시도한다.
+_ALADIN_PW = {"pw": None, "browser": None, "page": None, "disabled": False}
+_ALADIN_DIAG_COUNT = 0
+
+def _aladin_diag(status: int, text: str, url: str):
+    """실패 원인을 로그에서 바로 볼 수 있게 처음 3번만 상태 코드와 화면 앞부분을 출력"""
+    global _ALADIN_DIAG_COUNT
+    if _ALADIN_DIAG_COUNT >= 3:
+        return
+    _ALADIN_DIAG_COUNT += 1
+    snippet = re.sub(r"\s+", " ", text or "")[:200]
+    print(f"    [알라딘 진단] 상태코드={status} 길이={len(text or '')} 앞부분={snippet!r}")
+    print(f"    [알라딘 진단] 주소={url}")
+
+def _aladin_browser_get(url: str):
+    """Playwright 브라우저로 페이지 HTML을 가져온다. 실패하면 None."""
+    if _ALADIN_PW["disabled"]:
+        return None
+    try:
+        if _ALADIN_PW["page"] is None:
+            from playwright.sync_api import sync_playwright
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch(headless=True)
+            ctx = browser.new_context(user_agent=_UA, locale="ko-KR", timezone_id="Asia/Seoul")
+            page = ctx.new_page()
+            page.goto("https://www.aladin.co.kr/", timeout=20000)
+            _ALADIN_PW.update(pw=pw, browser=browser, page=page)
+            import atexit
+            atexit.register(lambda: (browser.close(), pw.stop()))
+        page = _ALADIN_PW["page"]
+        resp = page.goto(url, timeout=20000)
+        html = page.content()
+        if resp is not None and resp.status != 200:
+            print(f"    [알라딘 진단] 브라우저로도 상태코드={resp.status}")
+        return html
+    except Exception as e:
+        print(f"    [알라딘 진단] 브라우저 방식 실패: {e}")
+        _ALADIN_PW["disabled"] = True
+        return None
+
+def _aladin_ajax_get(url: str, referer: str):
+    """(상태코드, 본문). requests가 정상 응답이 아니면 브라우저로 재시도."""
+    try:
+        r = requests.get(url, headers={**AJAX_HEADERS, "Referer": referer}, timeout=15)
+        status, text = r.status_code, r.text
+    except Exception as e:
+        status, text = 0, str(e)
+    if status == 200 and ("hundred_list" in text or "없습니다" in text):
+        return status, text
+    _aladin_diag(status, text, url)
+    html = _aladin_browser_get(url)
+    if html is not None and ("hundred_list" in html or "없습니다" in html):
+        return 200, html
+    return status, text
+
 def get_aladin_reviews(isbn: str, cache: dict) -> list:
     title_key = f"_aladin_title_{isbn}"
     item_key = f"_aladin_item_{isbn}"
@@ -157,36 +212,36 @@ def get_aladin_reviews(isbn: str, cache: dict) -> list:
         failed = False  # 요청 실패 또는 '리뷰 블록은 있는데 하나도 못 읽음'이면 True
 
         # 구매평 (CommentReview)
-        r1 = requests.get(
+        r1_url = (
             f"https://www.aladin.co.kr/ucl/shop/product/ajax/GetCommunityListAjax.aspx"
             f"?ProductItemId={item_id}&itemId={item_id}&pageCount=10"
             f"&communitytype=CommentReview&nemoType=-1&page=1"
             f"&startNumber=1&endNumber=10&sort=2&IsOrderer=2&BranchType=1"
-            f"&IsAjax=true&pageType=0",
-            headers={**AJAX_HEADERS, "Referer": referer}, timeout=15,
+            f"&IsAjax=true&pageType=0"
         )
-        if r1.status_code != 200:
+        r1_status, r1_text = _aladin_ajax_get(r1_url, referer)
+        if r1_status != 200:
             failed = True
-        elif "없습니다" not in r1.text:
-            parsed = _parse_aladin_comment_reviews(r1.text, title, item_id)
-            if not parsed and "hundred_list" in r1.text:
+        elif "없습니다" not in r1_text:
+            parsed = _parse_aladin_comment_reviews(r1_text, title, item_id)
+            if not parsed and "hundred_list" in r1_text:
                 failed = True
             results.extend(parsed)
 
         # 일반 리뷰 (MyReview)
-        r2 = requests.get(
+        r2_url = (
             f"https://www.aladin.co.kr/ucl/shop/product/ajax/GetCommunityListAjax.aspx"
             f"?ProductItemId={item_id}&itemId={item_id}&pageCount=10"
             f"&communitytype=MyReview&nemoType=-1&page=1"
             f"&startNumber=1&endNumber=10&sort=2&IsOrderer=2&BranchType=1"
-            f"&IsAjax=true&pageType=0",
-            headers={**AJAX_HEADERS, "Referer": referer}, timeout=15,
+            f"&IsAjax=true&pageType=0"
         )
-        if r2.status_code != 200:
+        r2_status, r2_text = _aladin_ajax_get(r2_url, referer)
+        if r2_status != 200:
             failed = True
-        elif "없습니다" not in r2.text:
-            parsed = _parse_aladin_my_reviews(r2.text, title, item_id)
-            if not parsed and "hundred_list" in r2.text:
+        elif "없습니다" not in r2_text:
+            parsed = _parse_aladin_my_reviews(r2_text, title, item_id)
+            if not parsed and "hundred_list" in r2_text:
                 failed = True
             results.extend(parsed)
 
